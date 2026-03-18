@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic-settings
+anthropic
+openai
+google-genai
+chromadb
+pypdf
