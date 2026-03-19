@@ -9,7 +9,7 @@
 
 ```bash
 # Clone and enter the repo
-git clone <repo-url>
+git clone https://github.com/Googly-Boogly/agent_guardrail_layer
 cd agent_guardrail_layer
 
 # Create and activate a virtualenv

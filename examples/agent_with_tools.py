@@ -1,26 +1,27 @@
 """
 Demonstration: Autonomous agent with tool calling secured by GuardrailPipeline.
 
-Run:
-    ANTHROPIC_API_KEY=sk-ant-... python examples/agent_with_tools.py
+Run (Anthropic):
+    LLM_API_KEY=sk-ant-... LLM_PROVIDER=anthropic python examples/agent_with_tools.py
+
+Run (OpenAI):
+    LLM_API_KEY=sk-... LLM_PROVIDER=openai LLM_MODEL=gpt-5-mini python examples/agent_with_tools.py
 
 The script runs six scenarios — two benign and four adversarial — to demonstrate
 every guardrail path: allowlist blocking, path traversal, prompt injection,
 shell injection, output sanitization, and anomaly logging.
 
-Anomaly events are written to guardrail_events.jsonl in the working directory
-and echoed to stderr so you can watch them in real time.
+Anomaly events are written to the path in GUARDRAIL_LOG_FILE and echoed to stderr.
 """
 import asyncio
 import json
 import os
 import sys
 
-import anthropic
-
 # Allow running from repo root without installing the package
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.config import settings
 from src.guardrails import GuardrailPipeline, ParameterSchema, ToolSchema
 
 # ---------------------------------------------------------------------------
@@ -140,6 +141,70 @@ ANTHROPIC_TOOL_DEFS = [
     },
 ]
 
+# OpenAI function-calling tool definitions (same tools, different envelope format)
+OPENAI_TOOL_DEFS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a local file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the file"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web and return snippets",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_code",
+            "description": "Execute Python code in a sandboxed interpreter",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string"},
+                    "language": {"type": "string", "enum": ["python"]},
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email",
+            "description": "Send an email",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["to", "subject", "body"],
+            },
+        },
+    },
+]
+
 # ---------------------------------------------------------------------------
 # 2.  Mock tool implementations (no real I/O)
 # ---------------------------------------------------------------------------
@@ -173,60 +238,75 @@ TOOL_IMPLEMENTATIONS = {
 }
 
 # ---------------------------------------------------------------------------
-# 3.  Guardrailed agent loop
+# 3.  Guardrailed agent loop — routes to the configured LLM provider
 # ---------------------------------------------------------------------------
 
-async def run_agent(
+def _run_guardrailed_tool_call(
+    tool_name: str,
+    parameters: dict,
+    tool_use_id: str,
+    pipeline: GuardrailPipeline,
+    agent_id: str,
+) -> dict:
+    """Validate → execute → sanitize a single tool call. Returns a result dict."""
+    validation = pipeline.validate_tool_call(tool_name, parameters, agent_id)
+    if not validation.allowed:
+        return {
+            "blocked": True,
+            "tool_use_id": tool_use_id,
+            "content": (
+                "[GUARDRAIL BLOCKED] Tool call rejected:\n"
+                + "\n".join(f"  • {v}" for v in validation.violations)
+            ),
+        }
+
+    try:
+        raw_output = TOOL_IMPLEMENTATIONS[tool_name](parameters)
+    except Exception as exc:
+        raw_output = f"[TOOL ERROR] {type(exc).__name__}: {exc}"
+
+    san = pipeline.sanitize_output(str(raw_output), agent_id=agent_id, tool_name=tool_name)
+    if san.blocked:
+        return {
+            "blocked": True,
+            "tool_use_id": tool_use_id,
+            "content": f"[GUARDRAIL BLOCKED] Tool output sanitized. Flags: {san.flags}",
+        }
+    return {"blocked": False, "tool_use_id": tool_use_id, "content": san.sanitized_content}
+
+
+async def _run_agent_anthropic(
     task: str,
     pipeline: GuardrailPipeline,
     agent_id: str,
-    max_turns: int = 8,
+    max_turns: int,
 ) -> str:
-    """
-    Run a single task using the Anthropic tool_use API with full guardrail coverage.
+    import anthropic as _anthropic
 
-    The pipeline intercepts:
-      - Every LLM text response  (output sanitizer)
-      - Every tool call request  (tool validator → blocks before execution)
-      - Every tool return value  (output sanitizer → blocks before re-entering context)
-
-    Returns the agent's final text response.
-    """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return "[ERROR] ANTHROPIC_API_KEY environment variable is not set."
-
-    client = anthropic.AsyncAnthropic(api_key=api_key)
-    model = os.environ.get("LLM_MODEL", "claude-sonnet-4-6")
-
-    messages: list[dict] = [{"role": "user", "content": task}]
+    client = _anthropic.AsyncAnthropic(api_key=settings.llm_api_key)
     system = (
         "You are a helpful assistant with access to tools. "
         "Use tools when they are needed to complete the user's request accurately. "
         "If a tool call is rejected by the security layer, acknowledge the restriction "
         "and proceed with what you can."
     )
+    messages: list[dict] = [{"role": "user", "content": task}]
 
     for _turn in range(max_turns):
         response = await client.messages.create(
-            model=model,
+            model=settings.llm_model,
             max_tokens=4096,
             system=system,
             tools=ANTHROPIC_TOOL_DEFS,
             messages=messages,
         )
 
-        # --- Guardrail A: sanitize LLM text output before using it ---
+        # Guardrail A: sanitize LLM text output
         text_parts = [b.text for b in response.content if hasattr(b, "text") and b.text]
         if text_parts:
-            raw_text = " ".join(text_parts)
-            san = pipeline.sanitize_output(raw_text, agent_id=agent_id)
+            san = pipeline.sanitize_output(" ".join(text_parts), agent_id=agent_id)
             if san.blocked:
-                return (
-                    f"[GUARDRAIL] LLM response blocked.\n"
-                    f"Flags: {san.flags}\n"
-                    f"Sanitized: {san.sanitized_content[:300]}"
-                )
+                return f"[GUARDRAIL] LLM response blocked. Flags: {san.flags}"
 
         if response.stop_reason == "end_turn":
             return " ".join(
@@ -236,63 +316,97 @@ async def run_agent(
         if response.stop_reason != "tool_use":
             return f"[Unexpected stop_reason: {response.stop_reason!r}]"
 
-        # --- Process each tool call through the guardrail pipeline ---
         tool_results: list[dict] = []
-
         for block in response.content:
-            if not isinstance(block, anthropic.types.ToolUseBlock):
+            if not isinstance(block, _anthropic.types.ToolUseBlock):
                 continue
-
-            tool_name: str = block.name
-            parameters: dict = block.input  # dict[str, Any] from SDK
-            tool_use_id: str = block.id
-
-            # Guardrail B: validate the tool call
-            validation = pipeline.validate_tool_call(tool_name, parameters, agent_id)
-
-            if not validation.allowed:
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": (
-                        "[GUARDRAIL BLOCKED] Tool call rejected:\n"
-                        + "\n".join(f"  • {v}" for v in validation.violations)
-                    ),
-                    "is_error": True,
-                })
-                continue
-
-            # Execute the validated tool
-            try:
-                raw_output = TOOL_IMPLEMENTATIONS[tool_name](parameters)
-            except Exception as exc:
-                raw_output = f"[TOOL ERROR] {type(exc).__name__}: {exc}"
-
-            # Guardrail C: sanitize tool output before feeding it back to the model
-            san = pipeline.sanitize_output(
-                str(raw_output), agent_id=agent_id, tool_name=tool_name
+            result = _run_guardrailed_tool_call(
+                block.name, block.input, block.id, pipeline, agent_id
             )
-            if san.blocked:
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": (
-                        f"[GUARDRAIL BLOCKED] Tool output sanitized.\n"
-                        f"Flags: {san.flags}"
-                    ),
-                    "is_error": True,
-                })
-            else:
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": san.sanitized_content,
-                })
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": result["tool_use_id"],
+                "content": result["content"],
+                **({"is_error": True} if result["blocked"] else {}),
+            })
 
         messages.append({"role": "assistant", "content": list(response.content)})
         messages.append({"role": "user", "content": tool_results})
 
     return "[Agent reached max_turns without completing the task]"
+
+
+async def _run_agent_openai(
+    task: str,
+    pipeline: GuardrailPipeline,
+    agent_id: str,
+    max_turns: int,
+) -> str:
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=settings.llm_api_key)
+    system = (
+        "You are a helpful assistant with access to tools. "
+        "Use tools when they are needed to complete the user's request accurately. "
+        "If a tool call is rejected by the security layer, acknowledge the restriction "
+        "and proceed with what you can."
+    )
+    messages: list[dict] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": task},
+    ]
+
+    for _turn in range(max_turns):
+        response = await client.chat.completions.create(
+            model=settings.llm_model,
+            messages=messages,
+            tools=OPENAI_TOOL_DEFS,
+            tool_choice="auto",
+        )
+
+        choice = response.choices[0]
+        message = choice.message
+
+        # Guardrail A: sanitize LLM text output
+        if message.content:
+            san = pipeline.sanitize_output(message.content, agent_id=agent_id)
+            if san.blocked:
+                return f"[GUARDRAIL] LLM response blocked. Flags: {san.flags}"
+
+        if choice.finish_reason == "stop" or not message.tool_calls:
+            return message.content or "[Agent completed with no text output]"
+
+        # Append assistant message (with tool_calls) to history
+        messages.append(message)
+
+        # Guardrail B+C: validate and sanitize each tool call
+        for tc in message.tool_calls:
+            parameters = json.loads(tc.function.arguments)
+            result = _run_guardrailed_tool_call(
+                tc.function.name, parameters, tc.id, pipeline, agent_id
+            )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": result["tool_use_id"],
+                "content": result["content"],
+            })
+
+    return "[Agent reached max_turns without completing the task]"
+
+
+async def run_agent(
+    task: str,
+    pipeline: GuardrailPipeline,
+    agent_id: str,
+    max_turns: int = 8,
+) -> str:
+    """Route to the provider-specific agent loop based on settings.llm_provider."""
+    if settings.llm_provider == "anthropic":
+        return await _run_agent_anthropic(task, pipeline, agent_id, max_turns)
+    elif settings.llm_provider == "openai":
+        return await _run_agent_openai(task, pipeline, agent_id, max_turns)
+    else:
+        return f"[ERROR] Live agent loop not implemented for provider {settings.llm_provider!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -465,8 +579,8 @@ SCENARIOS = [
 
 
 async def run_live_scenarios(pipeline: GuardrailPipeline) -> None:
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("\n[SKIP] Live LLM scenarios require ANTHROPIC_API_KEY to be set.\n")
+    if settings.llm_api_key == "dummy":
+        print(f"\n[SKIP] Live LLM scenarios require LLM_API_KEY to be set (provider: {settings.llm_provider}).\n")
         return
 
     print("\n" + "=" * 70)
@@ -494,16 +608,17 @@ async def run_live_scenarios(pipeline: GuardrailPipeline) -> None:
 async def main() -> None:
     pipeline = GuardrailPipeline(
         tool_schemas=TOOL_SCHEMAS,
-        log_file="guardrail_events.jsonl",
-        log_stdout=True,
+        log_file=settings.guardrail_log_file,
+        log_stdout=settings.guardrail_log_stdout,
         rate_limit_max_calls=5,
-        rate_limit_window_seconds=60,
+        rate_limit_window_seconds=settings.guardrail_rate_limit_window_seconds,
     )
 
+    log_dest = settings.guardrail_log_file or "stderr only"
     print("=" * 70)
     print("Agent Guardrail Layer — Securing Autonomous AI Systems")
     print("=" * 70)
-    print("Anomaly events are echoed to stderr and written to guardrail_events.jsonl")
+    print(f"Anomaly events → {log_dest}")
 
     run_direct_guardrail_tests(pipeline)
     await run_live_scenarios(pipeline)
@@ -511,7 +626,7 @@ async def main() -> None:
     pipeline.close()
 
     print("\n" + "=" * 70)
-    print("Done. Inspect guardrail_events.jsonl for the full structured audit trail.")
+    print(f"Done. Inspect {log_dest} for the full structured audit trail.")
 
 
 if __name__ == "__main__":

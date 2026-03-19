@@ -1,0 +1,30 @@
+services:
+
+  # ── demo ─────────────────────────────────────────────────────────────────────
+  # Runs the example agent (direct guardrail tests + optional live LLM scenarios).
+  # Direct tests pass with LLM_API_KEY=dummy; live scenarios need a real key.
+  #
+  #   docker compose run --rm demo                     # direct tests only
+  #   ANTHROPIC_API_KEY=sk-ant-... docker compose run --rm demo   # live LLM
+  demo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # Pass your API key from the host shell — never hard-code it here.
+      # Falls back to "dummy" so direct tests always run without a real key.
+      LLM_API_KEY: ${LLM_API_KEY:-dummy}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-6}
+      GUARDRAIL_LOG_FILE: /app/logs/guardrail_events.jsonl
+      GUARDRAIL_LOG_STDOUT: "true"
+      GUARDRAIL_RATE_LIMIT_WINDOW_SECONDS: ${GUARDRAIL_RATE_LIMIT_WINDOW_SECONDS:-60}
+      GUARDRAIL_MAX_INPUT_LOG_CHARS: ${GUARDRAIL_MAX_INPUT_LOG_CHARS:-500}
+    volumes:
+      # Persist the JSONL audit log on the host so you can inspect it after
+      # the container exits.  Path on host: ./logs/guardrail_events.jsonl
+      - ./logs:/app/logs
+    command: python examples/agent_with_tools.py
+
+

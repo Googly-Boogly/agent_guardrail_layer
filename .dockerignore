@@ -1,0 +1,38 @@
+# Version control
+.git
+.gitignore
+
+# Python artifacts
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv
+venv
+env
+
+# Environment files — never bake secrets into the image
+.env
+.env.*
+
+# IDE and editor files
+.idea
+.vscode
+*.iml
+
+# Documentation (not needed in the image)
+docs/
+README.md
+CLAUDE.md
+
+# Test artifacts and logs
+logs/
+*.jsonl
+
+# Docker files themselves (avoid recursive copy confusion)
+Dockerfile
+docker-compose.yml
+.dockerignore
